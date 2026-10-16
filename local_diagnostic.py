@@ -3,6 +3,8 @@
 import argparse
 import ipaddress
 import json
+import os
+import platform
 import shutil
 import subprocess
 from datetime import datetime, timezone
@@ -32,10 +34,11 @@ def read_wifi(timeout=15):
     return data, "ok", None
 
 
-def build_report(data, status, message, manual=None):
+def build_report(data, status, message, manual=None, backend="termux-api"):
     manual = manual or {}
     values, sources = {}, {}
-    for key in ("ssid", "ip", "frequency_mhz", "rssi", "link_speed_mbps"):
+    for key in ("ssid", "ip", "cidr", "gateway", "dns", "system_dns", "security",
+                "interface", "frequency_mhz", "rssi", "signal_percent", "link_speed_mbps"):
         value = data.get(key)
         if value is None or value in ("", "<unknown ssid>", "0.0.0.0"):
             continue
@@ -44,41 +47,48 @@ def build_report(data, status, message, manual=None):
                 value = str(ipaddress.ip_address(value))
             except ValueError:
                 continue
-        values[key], sources[key] = value, "termux-api"
+        values[key], sources[key] = value, data.get("_sources", {}).get(key, backend)
     for key in ("ssid", "cidr", "gateway", "dns", "security"):
         if manual.get(key) is not None:
             values[key], sources[key] = manual[key], "manual"
     warnings = [message] if message else []
+    warnings.extend(data.get("_warnings", []))
     if "cidr" in values:
         interface = ipaddress.ip_interface(values["cidr"])
         values["network"] = str(interface.network)
-        sources["network"] = "derived_from_manual_cidr"
+        sources["network"] = f"derived_from_{sources['cidr']}_cidr"
         if values.get("ip") and values["ip"] != str(interface.ip):
-            warnings.append("La IP de Termux:API difiere del CIDR manual; verifica que correspondan a la misma conexión.")
+            warnings.append("La IP obtenida difiere del CIDR indicado; verifica que correspondan a la misma conexión.")
         if "ip" not in values:
-            values["ip"], sources["ip"] = str(interface.ip), "manual"
+            values["ip"], sources["ip"] = str(interface.ip), sources["cidr"]
     for key in ("ssid", "ip", "cidr", "network", "gateway", "dns", "security",
-                "frequency_mhz", "rssi", "link_speed_mbps"):
+                "frequency_mhz", "rssi", "signal_percent", "link_speed_mbps", "interface", "system_dns"):
         values.setdefault(key, None)
     findings = []
     if values["security"] and "TKIP" in values["security"].upper():
-        findings.append({"finding": "TKIP declarado: revisar configuración WPA2-AES/WPA3 con el administrador.",
-                         "source": "manual", "verified_by_radio": False})
-    return {"schema_version": 1, "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        findings.append({"finding": "TKIP indicado: revisar configuración WPA2-AES/WPA3 con el administrador.",
+                         "source": sources["security"], "verified_by_radio": False})
+    return {"schema_version": 2, "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "backend": backend,
             "scope": "local_device_only", "api_status": status,
             "connection": values, "sources": sources, "warnings": warnings,
             "findings": findings,
             "limitations": ["No se prueba aislamiento, intrusión, servicios ni configuración del router.",
                             "Los datos manuales no son mediciones; null indica dato no disponible.",
+                            "system_dns describe resolv.conf; puede ser un resolver local y no identifica necesariamente los DNS de la interfaz.",
+                            "La señal en porcentaje no equivale a RSSI en dBm. La seguridad en caché no certifica cifrado AES/TKIP negociado.",
                             "SSID y BSSID no prueban la identidad del propietario de una red."]}
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--local-only", action="store_true", help="Modo único; se usa siempre.")
-    parser.add_argument("--manual-only", action="store_true", help="No consultar Termux:API.")
+    backend_options = parser.add_mutually_exclusive_group()
+    backend_options.add_argument("--manual-only", action="store_true", help="No consultar el sistema.")
+    backend_options.add_argument("--backend", choices=("auto", "termux", "linux"), default="auto")
+    parser.add_argument("--interface", help="Interfaz Linux que se desea consultar, por ejemplo wlan0.")
     parser.add_argument("--ssid")
-    parser.add_argument("--cidr", help="IP/máscara de TU teléfono, por ejemplo 192.0.2.5/24")
+    parser.add_argument("--cidr", help="IP/máscara de TU dispositivo, por ejemplo 192.0.2.5/24")
     parser.add_argument("--gateway")
     parser.add_argument("--dns", action="append", help="Repetible para varios DNS")
     parser.add_argument("--security", help="Texto observado en Ajustes; no se verifica por radio")
@@ -94,8 +104,28 @@ def main():
             manual["dns"] = [str(ipaddress.ip_address(item)) for item in args.dns]
     except ValueError as exc:
         parser.error(str(exc))
-    data, status, message = ({}, "not_requested", None) if args.manual_only else read_wifi()
-    report = build_report(data, status, message, manual)
+    backend = args.backend
+    if args.manual_only:
+        backend, data, status, message = "manual", {}, "not_requested", None
+    else:
+        if backend == "auto":
+            if os.environ.get("ANDROID_ROOT") or shutil.which("termux-wifi-connectioninfo") or "com.termux" in os.environ.get("PREFIX", ""):
+                backend = "termux"
+            elif platform.system() == "Linux":
+                backend = "linux"
+            else:
+                backend = "unsupported"
+        if backend == "linux":
+            from linux_local import read_linux
+            data, status, message = read_linux(args.interface)
+        elif backend == "termux":
+            if args.interface:
+                parser.error("--interface solo está disponible para Linux.")
+            data, status, message = read_wifi()
+        else:
+            data, status, message = {}, "unavailable", "Sistema no compatible; usa --manual-only."
+    report = build_report(data, status, message, manual,
+                          "termux-api" if backend == "termux" else backend)
     output = json.dumps(report, ensure_ascii=False, indent=2)
     if args.output:
         try:
